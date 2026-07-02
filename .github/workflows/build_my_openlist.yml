@@ -1,7 +1,6 @@
 name: Build My OpenList
 
 on:
-  push:
   workflow_dispatch:
     inputs:
       version:
