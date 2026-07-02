@@ -1,0 +1,108 @@
+name: Build My OpenList
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '后端版本号 (例如 v4.1.9)'
+        default: 'v4.2.3'
+      frontend_tag:
+        description: '前端 Release 标签名 (例如 v4.1.8)'
+        default: 'v4.1.10'
+      lite:
+        description: '使用 Lite 前端'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          # --- 你可以随时在这里通过 # 注释掉不需要的平台 ---
+          #- windows-amd64
+          #- windows-arm64
+          #- linux-amd64-musl
+          - linux-arm64-musl
+          #- android-arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # 跟随官方将 Go 版本升级至 1.25.11
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.11'
+
+      # 保留你自定义的前端拉取逻辑
+      - name: Download and Prepare Frontend
+        env:
+          REPO: "UNI-earth/OpenList-Frontend"
+          TAG: ${{ github.event.inputs.frontend_tag }}
+        run: |
+          if [ "${{ github.event.inputs.lite }}" = "true" ]; then
+            FILE="openlist-frontend-dist-lite-${TAG}.tar.gz"
+          else
+            FILE="openlist-frontend-dist-${TAG}.tar.gz"
+          fi
+          
+          echo "正在下载前端: $FILE"
+          URL="https://github.com/$REPO/releases/download/$TAG/$FILE"
+          curl -L -o frontend.tar.gz "$URL"
+          
+          mkdir -p public/dist
+          tar -xzf frontend.tar.gz -C public/dist --strip-components=1
+          echo "前端文件已准备就绪"
+
+      # 使用官方提供的 CGO Actions 替代繁琐的手动命令
+      - name: Build with Official Action
+        uses: OpenListTeam/cgo-actions@v1.2.5
+        with:
+          targets: ${{ matrix.target }}
+          # 自动判定：如果是 musl 平台，自动注入外部静态链接指令
+          flags: ${{ contains(matrix.target, '-musl') && '-ldflags=-linkmode external -extldflags ''-static -fpic''' || '-ldflags=' }}
+          static-link-for-musl: true
+          musl-target-format: $os-$musl-$arch
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          out-dir: bin/release
+          musl-base-url: "https://github.com/OpenListTeam/musl-compilers/releases/latest/download/"
+          # 注入版本元数据，直接读取你在 workflow dispatch 中的输入
+          x-flags: |
+            github.com/OpenListTeam/OpenList/v4/internal/conf.BuiltAt=$built_at
+            github.com/OpenListTeam/OpenList/v4/internal/conf.GitAuthor=The OpenList Projects Contributors <noreply@openlist.team>
+            github.com/OpenListTeam/OpenList/v4/internal/conf.GitCommit=$git_commit
+            github.com/OpenListTeam/OpenList/v4/internal/conf.Version=${{ github.event.inputs.version }}
+            github.com/OpenListTeam/OpenList/v4/internal/conf.WebVersion=${{ github.event.inputs.frontend_tag }}
+          output: openlist-${{ matrix.target }}$ext
+
+      # 引入官方的检查机制，确保 musl 完全是静态编译的，防止运行报错
+      - name: Verify musl binary is static
+        if: contains(matrix.target, '-musl')
+        run: |
+          set -e
+          shopt -s nullglob
+          files=(bin/release/*-musl*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No musl binaries found"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            if readelf -l "$f" | grep -q "Requesting program interpreter"; then
+              echo "Dynamic binary detected: $f"
+              readelf -l "$f" | grep "Requesting program interpreter" || true
+              exit 1
+            fi
+          done
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenList-${{ matrix.target }}-${{ github.event.inputs.version }}
+          path: bin/release/*
